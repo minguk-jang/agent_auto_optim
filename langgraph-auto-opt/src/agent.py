@@ -171,6 +171,12 @@ class MockLLM:
         return json.dumps(slots, ensure_ascii=False)
 
     def _generate_question(self, system_content: str) -> str:
+        """
+        프롬프트 품질에 반응하는 질문 생성
+
+        좋은 프롬프트 (명확한 규칙)가 있으면 중복 질문 안함
+        나쁜 프롬프트 (규칙 없음)가 있으면 가끔 중복 질문 발생
+        """
         filled = {}
         missing = []
 
@@ -187,6 +193,13 @@ class MockLLM:
             if missing_str != "없음":
                 missing = re.findall(r"'(\w+)'", missing_str)
 
+        # 프롬프트 품질 체크: 중복 방지 규칙이 있는가?
+        has_redundancy_prevention = any([
+            "절대 다시 묻지 마세요" in system_content,
+            "이미 알고 있는 정보" in system_content,
+            "already" in system_content.lower() and "don't" in system_content.lower(),
+        ])
+
         questions = {
             "title": "어떤 일정인가요?",
             "date": "언제로 잡을까요?",
@@ -194,6 +207,16 @@ class MockLLM:
             "location": "장소는 어디인가요?",
         }
 
+        # 나쁜 프롬프트: 이미 채워진 정보도 다시 물어볼 수 있음
+        if not has_redundancy_prevention and filled:
+            # 50% 확률로 이미 채워진 정보를 다시 물어봄 (나쁜 행동)
+            import random
+            if random.random() < 0.5 and filled:
+                # 이미 채워진 슬롯 중 하나를 다시 물어봄
+                redundant_slot = random.choice(list(filled.keys()))
+                return questions.get(redundant_slot, "어떤 일정인가요?")
+
+        # 정상적인 질문: 빠진 정보만 물어봄
         for slot in ["title", "date", "time", "location"]:
             if slot in missing or (slot not in filled and slot in ["title", "date"]):
                 return questions.get(slot, "추가 정보를 알려주세요.")
