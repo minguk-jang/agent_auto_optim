@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from schemas import TestResult, OptimizationRun
 from run_tests import run_all_tests, generate_report
+from prompt_optimizer import PromptOptimizer, PromptImprovement
 
 
 # =============================================================================
@@ -100,28 +101,39 @@ class PromptSuggestion:
     suggested: str
 
 
-def generate_suggestions(patterns: list[FailurePattern]) -> list[PromptSuggestion]:
+def generate_suggestions(patterns: list[FailurePattern]) -> list[PromptImprovement]:
+    """
+    LLM을 사용해서 프롬프트 개선 제안 생성
+
+    Args:
+        patterns: 실패 패턴 리스트
+
+    Returns:
+        PromptImprovement 리스트
+    """
     suggestions = []
-    suggestion_id = 1
+    optimizer = PromptOptimizer()
 
     for pattern in patterns:
         if pattern.pattern_type == "redundant_question":
-            current = QUESTION_GENERATION_PROMPT.read_text()
+            # question_generation.txt 개선
+            current = QUESTION_GENERATION_PROMPT.read_text(encoding='utf-8')
+            improvement = optimizer.analyze_failures_and_suggest(
+                current_prompt=current,
+                failure_examples=pattern.examples,
+                prompt_name="question_generation"
+            )
+            suggestions.append(improvement)
 
-            addition = """
-중요: 현재 채워진 정보에 있는 내용은 절대 다시 묻지 마세요!
-"""
-
-            if "절대 다시 묻지 마세요!" not in current:
-                suggestions.append(PromptSuggestion(
-                    id=suggestion_id,
-                    target_file="question_generation.txt",
-                    change_type="add",
-                    description="중복 질문 방지 규칙 강화",
-                    original="",
-                    suggested=addition,
-                ))
-                suggestion_id += 1
+        elif pattern.pattern_type == "inefficient_questioning":
+            # question_generation.txt 개선 (효율성 측면)
+            current = QUESTION_GENERATION_PROMPT.read_text(encoding='utf-8')
+            improvement = optimizer.analyze_failures_and_suggest(
+                current_prompt=current,
+                failure_examples=pattern.examples,
+                prompt_name="question_generation"
+            )
+            suggestions.append(improvement)
 
     return suggestions
 
@@ -138,21 +150,20 @@ def backup_prompt(filepath: Path):
     print(f"Backup saved: {backup_path}")
 
 
-def apply_suggestion(suggestion: PromptSuggestion):
+def apply_suggestion(suggestion: PromptImprovement):
+    """프롬프트 개선안 적용"""
     filepath = PROMPTS_DIR / suggestion.target_file
     backup_prompt(filepath)
 
-    current = filepath.read_text()
+    # 새로운 프롬프트로 완전히 교체
+    filepath.write_text(suggestion.suggested_prompt, encoding='utf-8')
 
-    if suggestion.change_type == "add":
-        new_content = current + "\n" + suggestion.suggested
-    elif suggestion.change_type == "modify":
-        new_content = current.replace(suggestion.original, suggestion.suggested)
-    else:
-        new_content = current
-
-    filepath.write_text(new_content)
-    print(f"Applied suggestion {suggestion.id} to {suggestion.target_file}")
+    print(f"\n{'='*60}")
+    print(f"Applied improvement to {suggestion.target_file}")
+    print(f"{'='*60}")
+    print(f"Issue: {suggestion.issue_description}")
+    print(f"Reasoning: {suggestion.reasoning}")
+    print(f"{'='*60}\n")
 
 
 # =============================================================================
@@ -264,25 +275,21 @@ def main():
         if not suggestions:
             print("No suggestions.")
         else:
-            for s in suggestions:
-                print(f"\n[{s.id}] {s.description}")
-                print(f"  Target: {s.target_file}")
+            for i, s in enumerate(suggestions, 1):
+                print(f"\n[{i}] {s.target_file}")
+                print(f"  Issue: {s.issue_description}")
+                print(f"  Reasoning: {s.reasoning[:100]}...")  # 처음 100자만
 
     elif args.command == "apply":
         results = load_results()
         patterns = analyze_failures(results)
         suggestions = generate_suggestions(patterns)
 
-        target = None
-        for s in suggestions:
-            if s.id == args.suggestion:
-                target = s
-                break
-
-        if target:
-            apply_suggestion(target)
+        idx = args.suggestion - 1  # 1-based to 0-based
+        if 0 <= idx < len(suggestions):
+            apply_suggestion(suggestions[idx])
         else:
-            print(f"Suggestion {args.suggestion} not found.")
+            print(f"Suggestion {args.suggestion} not found. Available: 1-{len(suggestions)}")
 
     elif args.command == "auto":
         auto_optimize(

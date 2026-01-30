@@ -4,12 +4,17 @@ LangGraph Agent for Schedule Creation Task
 
 import os
 import re
+from pathlib import Path
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 # Mock 모드 체크
 USE_MOCK = os.environ.get("USE_MOCK", "false").lower() == "true" or not os.environ.get("ANTHROPIC_API_KEY")
+
+# Paths
+BASE_DIR = Path(__file__).parent.parent
+PROMPTS_DIR = BASE_DIR / "prompts"
 
 if USE_MOCK:
     class SystemMessage:
@@ -45,45 +50,25 @@ class AgentState(TypedDict):
 
 
 # =============================================================================
-# Prompts
+# Prompts - Load from files
 # =============================================================================
 
-SLOT_EXTRACTION_PROMPT = """당신은 일정 생성을 돕는 어시스턴트입니다.
-사용자의 메시지에서 다음 정보를 추출하세요:
+def load_prompt(filename: str) -> str:
+    """프롬프트 파일에서 내용을 로드"""
+    prompt_file = PROMPTS_DIR / filename
+    if not prompt_file.exists():
+        raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
+    return prompt_file.read_text(encoding='utf-8').strip()
 
-- title: 일정 제목/이름
-- date: 날짜 (예: 2025-01-31, 내일, 금요일, 다음주 월요일)
-- time: 시간 (예: 15:00, 오후 3시, 점심)
-- location: 장소
 
-JSON 형식으로만 응답하세요. 정보가 없으면 null로 표시하세요.
-비문이나 줄임말(ㅇㅇ, ㄱㄱ 등)은 무시하고 핵심 정보만 추출하세요.
+def get_slot_extraction_prompt() -> str:
+    """슬롯 추출 프롬프트 로드"""
+    return load_prompt("slot_extraction.txt")
 
-예시:
-입력: "내일 3시 강남에서 회의"
-출력: {"title": "회의", "date": "내일", "time": "15:00", "location": "강남"}
 
-입력: "치과 가야됨"
-출력: {"title": "치과", "date": null, "time": null, "location": null}
-"""
-
-QUESTION_GENERATION_PROMPT = """당신은 일정 생성을 돕는 어시스턴트입니다.
-사용자에게 부족한 정보를 자연스럽게 물어보세요.
-
-현재 채워진 정보:
-{filled_slots}
-
-아직 필요한 정보:
-{missing_slots}
-
-규칙:
-1. 한 번에 하나의 질문만 하세요
-2. 가장 중요한 정보(날짜 > 시간 > 장소)부터 물어보세요
-3. 자연스럽고 간결하게 물어보세요
-4. 이미 알고 있는 정보는 절대 다시 묻지 마세요
-
-질문만 출력하세요.
-"""
+def get_question_generation_prompt() -> str:
+    """질문 생성 프롬프트 로드"""
+    return load_prompt("question_generation.txt")
 
 
 # =============================================================================
@@ -241,7 +226,7 @@ def extract_slots(state: AgentState) -> AgentState:
     context += f"\n새 입력: {new_input}"
 
     messages = [
-        SystemMessage(content=SLOT_EXTRACTION_PROMPT),
+        SystemMessage(content=get_slot_extraction_prompt()),
         HumanMessage(content=context)
     ]
 
@@ -301,7 +286,7 @@ def generate_question(state: AgentState) -> AgentState:
     else:
         missing_to_ask = missing
 
-    prompt = QUESTION_GENERATION_PROMPT.format(
+    prompt = get_question_generation_prompt().format(
         filled_slots=filled if filled else "없음",
         missing_slots=missing_to_ask if missing_to_ask else "없음"
     )

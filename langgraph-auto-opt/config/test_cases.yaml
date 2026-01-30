@@ -59,6 +59,42 @@ test_cases:
         location: ~
     max_turns: 3
 
+  # Edge Case - 애매한 시간 표현
+  - id: tc_006
+    query: "내일 회의 있어"
+    context:
+      user_intent: "회의 일정"
+      ground_truth:
+        title: "회의"
+        date: "내일"
+        time: ~
+        location: ~
+    max_turns: 2
+
+  # Edge Case - 부분 정보만 있음
+  - id: tc_007
+    query: "점심 약속"
+    context:
+      user_intent: "점심 약속"
+      ground_truth:
+        title: "점심 약속"
+        date: ~
+        time: "12:00"
+        location: ~
+    max_turns: 2
+
+  # Hard - 중의적 표현
+  - id: tc_008
+    query: "다음주 미팅"
+    context:
+      user_intent: "미팅 일정"
+      ground_truth:
+        title: "미팅"
+        date: "다음주"
+        time: ~
+        location: ~
+    max_turns: 2
+
 
 slot_schema:
   - name: title

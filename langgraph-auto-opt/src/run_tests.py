@@ -17,6 +17,7 @@ from orchestrator import (
     RESULTS_DIR,
     ANSWER_FILE,
 )
+from metrics import calculate_detailed_metrics, print_detailed_metrics
 
 
 # =============================================================================
@@ -222,6 +223,10 @@ def generate_report(results: list[TestResult] = None):
 
     print("="*60)
 
+    # 상세 메트릭 출력
+    detailed_metrics = calculate_detailed_metrics(results)
+    print_detailed_metrics(detailed_metrics)
+
     return {
         "total": total,
         "passed": passed,
@@ -229,6 +234,7 @@ def generate_report(results: list[TestResult] = None):
         "pass_rate": pass_rate,
         "avg_turns": avg_turns,
         "results": results,
+        "detailed_metrics": detailed_metrics,
     }
 
 
