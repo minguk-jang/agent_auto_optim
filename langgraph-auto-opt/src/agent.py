@@ -1,0 +1,412 @@
+"""
+LangGraph Agent for Schedule Creation Task
+"""
+
+import os
+import re
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
+# Mock 모드 체크
+USE_MOCK = os.environ.get("USE_MOCK", "false").lower() == "true" or not os.environ.get("ANTHROPIC_API_KEY")
+
+if USE_MOCK:
+    class SystemMessage:
+        def __init__(self, content: str):
+            self.content = content
+
+    class HumanMessage:
+        def __init__(self, content: str):
+            self.content = content
+else:
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import SystemMessage, HumanMessage
+
+
+# =============================================================================
+# State Definition
+# =============================================================================
+
+class Slots(TypedDict, total=False):
+    title: str | None
+    date: str | None
+    time: str | None
+    location: str | None
+
+
+class AgentState(TypedDict):
+    query: str
+    slots: Slots
+    history: list[dict]
+    current_question: str | None
+    is_complete: bool
+    user_answer: str | None
+
+
+# =============================================================================
+# Prompts
+# =============================================================================
+
+SLOT_EXTRACTION_PROMPT = """당신은 일정 생성을 돕는 어시스턴트입니다.
+사용자의 메시지에서 다음 정보를 추출하세요:
+
+- title: 일정 제목/이름
+- date: 날짜 (예: 2025-01-31, 내일, 금요일, 다음주 월요일)
+- time: 시간 (예: 15:00, 오후 3시, 점심)
+- location: 장소
+
+JSON 형식으로만 응답하세요. 정보가 없으면 null로 표시하세요.
+비문이나 줄임말(ㅇㅇ, ㄱㄱ 등)은 무시하고 핵심 정보만 추출하세요.
+
+예시:
+입력: "내일 3시 강남에서 회의"
+출력: {"title": "회의", "date": "내일", "time": "15:00", "location": "강남"}
+
+입력: "치과 가야됨"
+출력: {"title": "치과", "date": null, "time": null, "location": null}
+"""
+
+QUESTION_GENERATION_PROMPT = """당신은 일정 생성을 돕는 어시스턴트입니다.
+사용자에게 부족한 정보를 자연스럽게 물어보세요.
+
+현재 채워진 정보:
+{filled_slots}
+
+아직 필요한 정보:
+{missing_slots}
+
+규칙:
+1. 한 번에 하나의 질문만 하세요
+2. 가장 중요한 정보(날짜 > 시간 > 장소)부터 물어보세요
+3. 자연스럽고 간결하게 물어보세요
+4. 이미 알고 있는 정보는 절대 다시 묻지 마세요
+
+질문만 출력하세요.
+"""
+
+
+# =============================================================================
+# LLM Setup
+# =============================================================================
+
+def get_llm():
+    if USE_MOCK:
+        return MockLLM()
+    return ChatAnthropic(
+        model="claude-sonnet-4-20250514",
+        temperature=0,
+        max_tokens=1024,
+    )
+
+
+class MockLLM:
+    """테스트용 Mock LLM - 규칙 기반 슬롯 추출"""
+
+    def invoke(self, messages):
+        content = messages[-1].content if hasattr(messages[-1], 'content') else str(messages[-1])
+        system_content = messages[0].content if hasattr(messages[0], 'content') else str(messages[0])
+
+        if "JSON 형식으로만 응답" in system_content:
+            return MockResponse(self._extract_slots(content))
+        else:
+            return MockResponse(self._generate_question(system_content))
+
+    def _extract_slots(self, text: str) -> str:
+        import json
+
+        slots = {"title": None, "date": None, "time": None, "location": None}
+
+        # 날짜 패턴
+        date_patterns = [
+            (r'내일', '내일'),
+            (r'모레', '모레'),
+            (r'오늘', '오늘'),
+            (r'다음\s*주\s*(월|화|수|목|금|토|일)요일', lambda m: f'다음주 {m.group(1)}요일'),
+            (r'다음\s*주', '다음주'),
+            (r'(월|화|수|목|금|토|일)요일', lambda m: f'{m.group(1)}요일'),
+        ]
+        for pattern, result in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                if callable(result):
+                    slots["date"] = result(match)
+                else:
+                    slots["date"] = result
+                break
+
+        # 시간 패턴
+        time_patterns = [
+            (r'오전\s*(\d{1,2})\s*시', lambda m: f'{int(m.group(1)):02d}:00'),
+            (r'오후\s*(\d{1,2})\s*시', lambda m: f'{int(m.group(1)) + 12 if int(m.group(1)) < 12 else int(m.group(1)):02d}:00'),
+            (r'(\d{1,2})\s*시', lambda m: f'{int(m.group(1)) + 12 if int(m.group(1)) < 8 else int(m.group(1)):02d}:00'),
+            (r'점심', '12:00'),
+            (r'저녁', '18:00'),
+            (r'오후', '14:00'),
+        ]
+        for pattern, result in time_patterns:
+            match = re.search(pattern, text)
+            if match:
+                if callable(result):
+                    slots["time"] = result(match)
+                else:
+                    slots["time"] = result
+                break
+
+        # 장소 패턴
+        location_patterns = [
+            r'(강남역\s*스타벅스)',
+            r'(강남역)',
+            r'(\w+역)',
+            r'(\w+병원)',
+        ]
+        for pattern in location_patterns:
+            match = re.search(pattern, text)
+            if match:
+                slots["location"] = match.group(1).strip()
+                break
+
+        # 제목 패턴
+        title_patterns = [
+            (r'팀\s*회의', '팀 회의'),
+            (r'회의', '회의'),
+            (r'미팅', '미팅'),
+            (r'면접', '면접'),
+            (r'치과', '치과'),
+            (r'병원', '병원'),
+            (r'저녁\s*약속', '저녁 약속'),
+            (r'점심\s*약속', '점심 약속'),
+            (r'약속', '약속'),
+        ]
+        for pattern, title in title_patterns:
+            if re.search(pattern, text):
+                slots["title"] = title
+                break
+
+        return json.dumps(slots, ensure_ascii=False)
+
+    def _generate_question(self, system_content: str) -> str:
+        filled = {}
+        missing = []
+
+        filled_match = re.search(r'현재 채워진 정보:\s*\n([^\n]+)', system_content)
+        if filled_match:
+            filled_str = filled_match.group(1).strip()
+            if filled_str != "없음" and filled_str != "{}":
+                pairs = re.findall(r"'(\w+)':\s*'([^']+)'", filled_str)
+                filled = dict(pairs)
+
+        missing_match = re.search(r'아직 필요한 정보:\s*\n([^\n]+)', system_content)
+        if missing_match:
+            missing_str = missing_match.group(1).strip()
+            if missing_str != "없음":
+                missing = re.findall(r"'(\w+)'", missing_str)
+
+        questions = {
+            "title": "어떤 일정인가요?",
+            "date": "언제로 잡을까요?",
+            "time": "몇 시에 하실 건가요?",
+            "location": "장소는 어디인가요?",
+        }
+
+        for slot in ["title", "date", "time", "location"]:
+            if slot in missing or (slot not in filled and slot in ["title", "date"]):
+                return questions.get(slot, "추가 정보를 알려주세요.")
+
+        return "추가 정보를 알려주세요."
+
+
+class MockResponse:
+    def __init__(self, content: str):
+        self.content = content
+
+
+# =============================================================================
+# Node Functions
+# =============================================================================
+
+def extract_slots(state: AgentState) -> AgentState:
+    llm = get_llm()
+
+    if state.get("user_answer"):
+        new_input = state["user_answer"]
+    else:
+        new_input = state["query"]
+
+    context = f"원본 요청: {state['query']}\n"
+    if state.get("history"):
+        context += "대화 히스토리:\n"
+        for turn in state["history"]:
+            context += f"- {turn['role']}: {turn['content']}\n"
+    context += f"\n새 입력: {new_input}"
+
+    messages = [
+        SystemMessage(content=SLOT_EXTRACTION_PROMPT),
+        HumanMessage(content=context)
+    ]
+
+    response = llm.invoke(messages)
+
+    import json
+    try:
+        content = response.content
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+
+        extracted = json.loads(content.strip())
+    except (json.JSONDecodeError, IndexError):
+        extracted = {}
+
+    current_slots = state.get("slots", {})
+    for key in ["title", "date", "time", "location"]:
+        if extracted.get(key):
+            current_slots[key] = extracted[key]
+
+    history = state.get("history", []).copy()
+    if state.get("user_answer"):
+        history.append({"role": "user", "content": state["user_answer"]})
+
+    return {
+        **state,
+        "slots": current_slots,
+        "history": history,
+        "user_answer": None,
+    }
+
+
+def check_completion(state: AgentState) -> AgentState:
+    slots = state.get("slots", {})
+    required = ["title", "date"]
+    missing = [s for s in required if not slots.get(s)]
+    is_complete = len(missing) == 0
+
+    return {
+        **state,
+        "is_complete": is_complete,
+    }
+
+
+def generate_question(state: AgentState) -> AgentState:
+    llm = get_llm()
+    slots = state.get("slots", {})
+
+    filled = {k: v for k, v in slots.items() if v}
+    missing = [k for k in ["title", "date", "time", "location"] if not slots.get(k)]
+
+    required_missing = [s for s in ["title", "date"] if s in missing]
+    if required_missing:
+        missing_to_ask = required_missing
+    else:
+        missing_to_ask = missing
+
+    prompt = QUESTION_GENERATION_PROMPT.format(
+        filled_slots=filled if filled else "없음",
+        missing_slots=missing_to_ask if missing_to_ask else "없음"
+    )
+
+    messages = [
+        SystemMessage(content=prompt),
+        HumanMessage(content="질문을 생성해주세요.")
+    ]
+
+    response = llm.invoke(messages)
+    question = response.content.strip()
+
+    history = state.get("history", []).copy()
+    history.append({"role": "agent", "content": question})
+
+    return {
+        **state,
+        "current_question": question,
+        "history": history,
+    }
+
+
+# =============================================================================
+# Routing
+# =============================================================================
+
+def should_continue(state: AgentState) -> str:
+    if state.get("is_complete"):
+        return "end"
+    else:
+        return "generate_question"
+
+
+# =============================================================================
+# Graph Construction
+# =============================================================================
+
+def create_agent():
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("extract_slots", extract_slots)
+    workflow.add_node("check_completion", check_completion)
+    workflow.add_node("generate_question", generate_question)
+
+    workflow.add_edge(START, "extract_slots")
+    workflow.add_edge("extract_slots", "check_completion")
+    workflow.add_conditional_edges(
+        "check_completion",
+        should_continue,
+        {
+            "end": END,
+            "generate_question": "generate_question",
+        }
+    )
+    workflow.add_edge("generate_question", END)
+
+    checkpointer = MemorySaver()
+
+    return workflow.compile(checkpointer=checkpointer)
+
+
+# =============================================================================
+# Convenience Functions
+# =============================================================================
+
+def run_agent_turn(
+    agent,
+    thread_id: str,
+    query: str | None = None,
+    user_answer: str | None = None,
+    current_state: dict | None = None,
+) -> AgentState:
+    config = {"configurable": {"thread_id": thread_id}}
+
+    if query:
+        initial_state = {
+            "query": query,
+            "slots": {},
+            "history": [{"role": "user", "content": query}],
+            "current_question": None,
+            "is_complete": False,
+            "user_answer": None,
+        }
+        result = agent.invoke(initial_state, config)
+    else:
+        if current_state is None:
+            raise ValueError("current_state required for resume")
+
+        updated_state = {
+            "query": current_state.get("query", ""),
+            "slots": current_state.get("slots", {}),
+            "history": current_state.get("history", []),
+            "current_question": current_state.get("current_question"),
+            "is_complete": False,
+            "user_answer": user_answer,
+        }
+        result = agent.invoke(updated_state, config)
+
+    return result
+
+
+if __name__ == "__main__":
+    agent = create_agent()
+
+    print("=== Test: 완전한 정보 ===")
+    result = run_agent_turn(agent, "test1", query="내일 3시 강남에서 회의")
+    print(f"Slots: {result['slots']}")
+    print(f"Complete: {result['is_complete']}")
